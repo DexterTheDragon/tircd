@@ -443,7 +443,7 @@ sub tircd_setup_authenticated_user {
     $heap->{'channels'} = eval {retrieve($config{'storage_path'} . '/' . $heap->{'username'} . '.channels');};
   }
 
-  my @user_settings = qw(update_timeline update_directs timeline_count long_messages min_length max_splits join_silent filter_self shorten_urls convert_irc_replies store_access_tokens access_token access_token_secret auto_post display_ticker_slots show_realname expand_urls password);
+  my @user_settings = qw(update_timeline update_directs timeline_count long_messages min_length max_splits join_silent filter_self shorten_urls convert_irc_replies store_access_tokens access_token access_token_secret auto_post display_ticker_slots show_realname expand_urls password create_lists);
 
   # update users config to contain all necessary settings, weed out unnecessary
   foreach my $s (@user_settings) {
@@ -738,6 +738,7 @@ sub irc_join {
   return;
   }
 
+  my $error;
   my @chans = split(/\,/,$data->{'params'}[0]);
   foreach my $chan (@chans) {
     $chan =~ s/\s//g;
@@ -750,6 +751,73 @@ sub irc_join {
     if (!exists $heap->{'channels'}->{$chan} ) {
       $heap->{'channels'}->{$chan} = {};
       $heap->{'channels'}->{$chan}->{'names'}->{$heap->{'username'}} = '@';
+      # search for an existing list
+      my $list_id = 0;
+      my $lists = eval { $heap->{'twitter'}->get_lists() };
+      $error = $@;
+      if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+        $kernel->call($_[SESSION],'twitter_api_error','Unable to get lists',$error);
+      }
+      if ($lists) {
+        foreach my $list (@{$lists}) {
+          if ($list->{'name'} eq substr($chan, 1)) {
+            $list_id = $list->{'id'};
+          }
+        }
+        # otherwise create a new private list
+        if ($heap->{'config'}->{'create_lists'}) {
+          if (!$list_id) {
+            my $list = $heap->{'twitter'}->create_list({name => substr($chan, 1), mode => 'private'});
+            $error = $@;
+            if ($list) {
+              $list_id = $list->{'id'};
+              $kernel->post('logger','log',"Created list named $chan",$heap->{'username'});
+              $kernel->yield('server_reply',442,$chan,"Created list named $chan");
+            } else {
+              if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+                $kernel->call($_[SESSION],'twitter_api_error','Unable to create list',$error);
+              }
+            }
+          }
+        }
+      }
+
+      if ($list_id) {
+        $heap->{'channels'}->{$chan}->{'list_id'} = $list_id;
+
+        # get list members
+        my @friends = ();
+        my $cursor = -1;
+        my $error;
+        while (my $f = eval { $heap->{'twitter'}->list_members({cursor => $cursor, list_id => $heap->{'channels'}->{$chan}->{'list_id'}})}) {
+          $cursor = $f->{'next_cursor'};
+          foreach my $user ($f->{'users'}) {
+            foreach my $u (@{$user}) {
+              push(@friends, $u);
+            }
+          }
+          last if $cursor == 0;
+        }
+        $error = $@;
+
+        #if we have no data, there was an error, or the list is empty
+        if ($cursor == -1 && ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+          $kernel->call($_[SESSION],'twitter_api_error','Unable to get list members.',$error);
+        }
+
+        #the the list of our users for /NAMES
+        foreach my $user (@friends) {
+          my $ov ='';
+          if ($user->{'screen_name'} eq $heap->{'username'}) {
+            $ov = '@';
+          } elsif ($kernel->call($_[SESSION],'getfollower',$user->{'screen_name'})) {
+            $ov='+';
+          }
+          #keep a copy of who is in this channel
+          $heap->{'channels'}->{$chan}->{'names'}->{$user->{'screen_name'}} = $ov;
+        }
+        $heap->{'channels'}->{$chan}->{'since_id'} = 0;
+      }
     }
 
     $heap->{'channels'}->{$chan}->{'joined'} = 1;
@@ -1319,6 +1387,21 @@ sub irc_invite {
     return;
   }
 
+  if ($heap->{'channels'}->{$chan}->{'list_id'}) {
+    my $user = eval { $heap->{'twitter'}->add_list_member({list_id => $heap->{'channels'}->{$chan}->{'list_id'}, screen_name => $target}) };
+    my $ov = '';
+    if ($user->{'following'} == 1) {
+      $ov = '+';
+    }
+    $heap->{'channels'}->{$chan}->{'names'}->{$target} = $ov;
+    $kernel->yield('server_reply',341,$target,$chan);
+    $kernel->yield('user_msg','JOIN',$target,$chan);
+    if ($heap->{'channels'}->{$chan}->{'names'}->{$target} ne '') {
+      $kernel->yield('server_reply','MODE',$chan,'+v',$target);
+    }
+    return;
+  }
+
   if ($chan ne '#twitter') { #if it's not our main channel, just fake the user in, if we already follow them
     if (exists $heap->{'channels'}->{'#twitter'}->{'names'}->{$target}) {
       $heap->{'channels'}->{$chan}->{'names'}->{$target} = $heap->{'channels'}->{'#twitter'}->{'names'}->{$target};
@@ -1385,6 +1468,22 @@ sub irc_kick {
   }
 
   my ($kickee) = @matches;
+
+  if ( $heap->{'channels'}->{$chan}->{'list_id'}) {
+    my $del = eval { $heap->{'twitter'}->delete_list_member({screen_name => $kickee, list_id => $heap->{'channels'}->{$chan}->{'list_id'}}) };
+    my $error = $@;
+
+    #if we have no data, there was an error
+    if ($error) {
+      if ($error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
+        $kernel->call($_[SESSION],'twitter_api_error','Unable to remove user from list',$error);
+        return;
+      } else {
+        $kernel->post('logger','log',"Unexpected Error: $error",$heap->{'username'});
+        $kernel->yield('server_reply',461,$chan,"Unable to remove $kickee from list");
+      }
+    }
+  }
 
   if ($chan ne '#twitter') {
     delete $heap->{'channels'}->{$chan}->{'names'}->{$kickee};
@@ -1691,7 +1790,7 @@ sub twitter_timeline {
       $is_following = eval { $heap->{'twitter'}->show_user({screen_name => $item->{'user'}->{'screen_name'}}) };
       $kernel->post('logger','log','Got name: ' . $is_following->{'name'} . ' following: ' . $is_following->{'following'}, $heap->{'username'}) if $config{'debug'} >=2;
       if ($is_following->{'following'} == 1) {
-  # We are following this user, add to 'friends'
+        # We are following this user, add to 'friends'
         push(@{$heap->{'friends'}},$tmp);
       }
       # Join them to #twitter if they are not yourself
@@ -1729,7 +1828,11 @@ sub twitter_timeline {
           }
           # - Send the message to the other channels the user is in if the user is not "me"
           if ($chan ne '#twitter' && exists $heap->{'channels'}->{$chan}->{'names'}->{$item->{'user'}->{'screen_name'}} && $item->{'user'}->{'screen_name'} ne $heap->{'username'}) {
-            $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},$chan,$item->{'tircd_ticker_slot_display'} . $item->{'text'});
+            if (defined($item->{'retweeted_status'})) {
+              $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},$chan,$item->{'tircd_ticker_slot_display'} . 'RT @' . $item->{'retweeted_status'}->{'user'}->{'screen_name'} . ': ' . $item->{'retweeted_status'}->{'text'});
+            } else {
+              $kernel->yield('user_msg','PRIVMSG',$item->{'user'}->{'screen_name'},$chan,$item->{'tircd_ticker_slot_display'} . $item->{'text'});
+            }
           }
           # - And set topic on the #twitter channel if user is me and the topic is not already set
           if ($chan eq '#twitter' && $item->{'user'}->{'screen_name'} eq $heap->{'username'} && $item->{'text'} ne $heap->{'channels'}->{$chan}->{'topic'}) {
