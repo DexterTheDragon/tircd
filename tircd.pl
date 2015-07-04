@@ -516,7 +516,7 @@ sub tircd_verify_ssl {
   }
 
   # check ssl cert using LWP
-  my $api_check = Net::Twitter::Lite::WithAPIv1_1->new;
+  my $api_check = Net::Twitter::Lite::WithAPIv1_1->new(ssl => 1);
   my $sslcheck = LWP::UserAgent->new;
   my $apiurl = URI->new($api_check->{'apiurl'});
   # second level domain, aka domain.tld. if this is present in the certificate, we are happy
